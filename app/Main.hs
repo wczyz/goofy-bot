@@ -22,6 +22,7 @@ import UnliftIO
 data BotAction
   = PlayVoice String
   | LeaveVoice
+  | DisplayQueue
 
 data GuildContext = GuildContext
   { songQueries :: [String],
@@ -34,25 +35,29 @@ parser = flip info fullDesc $ helper <*> commandParser
     commandParser =
       subparser $
         mconcat
-          [ leaveParser,
-            playParser
+          [ playParser,
+            leaveParser,
+            displayQueueParser
           ]
 
-    leaveParser =
-      command "leave" $
-        info (pure LeaveVoice) (progDesc "Leave a voice channel")
     playParser =
       command "play" $
         flip info (progDesc "Queue something to play!") $
           PlayVoice . unwords
             <$> some (argument str (metavar "QUERY" <> help "Search query/URL"))
+    leaveParser =
+      command "leave" $
+        info (pure LeaveVoice) (progDesc "Leave a voice channel")
+    displayQueueParser =
+      command "queue" $
+        info (pure DisplayQueue) (progDesc "Display the queue")
 
 main :: IO ()
 main = do
   tok <- TIO.readFile "./auth-token.secret"
 
   queries <- M.newIO
-  void $
+  userFacingError <-
     runDiscord $
       def
         { discordToken = tok,
@@ -61,7 +66,8 @@ main = do
           discordOnEvent = eventHandler queries,
           discordOnLog = TIO.putStrLn
         }
-  putStrLn "Exiting..."
+  TIO.putStrLn userFacingError
+  TIO.putStrLn "Exiting..."
 
 eventHandler :: M.Map String GuildContext -> Event -> DiscordHandler ()
 eventHandler contexts (MessageCreate msg) = case messageGuildId msg of
@@ -137,3 +143,21 @@ handleCommand contexts msg gid (PlayVoice q) = do
       R.CreateMessage (messageChannelId msg) $
         T.pack $
           "Queued for playback: " <> show q
+handleCommand contexts msg gid DisplayQueue = do
+  context <- atomically $ M.lookup (show gid) contexts
+  let queue = case context of
+        Nothing -> []
+        Just c -> songQueries c
+  void $
+    restCall $
+      R.CreateMessage (messageChannelId msg) $
+        T.pack $
+          queueToString queue
+
+-- Helpers
+queueToString :: [String] -> String
+queueToString [] = "Empty queue"
+queueToString xs =
+  concatMap
+    (\(i, x) -> show i <> ". " <> x <> "\n")
+    (zip ([1 ..] :: [Int]) xs)
