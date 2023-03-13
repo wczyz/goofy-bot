@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Main where
 
 import Conduit
@@ -73,7 +75,9 @@ eventHandler :: M.Map String GuildContext -> Event -> DiscordHandler ()
 eventHandler contexts (MessageCreate msg) = case messageGuildId msg of
   Nothing -> pure ()
   Just gid -> do
-    let args = map T.unpack $ T.words $ messageContent msg
+    let content = messageContent msg
+        cid = messageChannelId msg
+        args = map T.unpack $ T.words content
     case args of
       ("bot" : _) -> case execParserPure defaultPrefs parser $ tail args of
         Success x -> handleCommand contexts msg gid x
@@ -85,7 +89,9 @@ eventHandler contexts (MessageCreate msg) = case messageGuildId msg of
                   fst $
                     renderFailure failure "bot"
         _ -> pure ()
-      _ -> pure ()
+      _ -> when ("birbol" `T.isInfixOf` content) $ do
+        void $ restCall (R.CreateReaction (cid, messageId msg) "eyes")
+        void $ restCall (R.CreateMessage cid "Brzydko!")
 eventHandler _ _ = pure ()
 
 playYouTube :: String -> Voice ()
@@ -94,7 +100,7 @@ playYouTube query = do
   resource <- createYoutubeResource query $ Just $ HaskellTransformation $ packInt16C .| adjustVolume .| unpackInt16C
 
   case resource of
-    Nothing -> liftIO $ print "whoops"
+    Nothing -> liftIO $ print "Couldn't create a youtube resource"
     Just re -> play re UnknownCodec
 
 joinVoiceChannel :: M.Map String GuildContext -> GuildId -> String -> DiscordHandler ()
