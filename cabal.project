@@ -1,0 +1,3 @@
+packages: .
+          ../opus
+          ../discord-haskell-voice

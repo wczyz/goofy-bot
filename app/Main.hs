@@ -1,39 +1,139 @@
-{-# LANGUAGE OverloadedStrings #-}  -- allows "string literals" to be Text
-
 module Main where
 
-import           Control.Monad (when, void)
-import           UnliftIO.Concurrent
-import           Data.Text (isPrefixOf, toLower)
+import Conduit
+import Control.Monad
+  ( forever,
+    void,
+    when,
+  )
+import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
-
-import           Discord
-import           Discord.Types
+import Discord
 import qualified Discord.Requests as R
+import Discord.Types
+import Discord.Voice
+import Discord.Voice.Conduit
+import Options.Applicative
+import qualified StmContainers.Map as M
+import UnliftIO
+  ( atomically,
+  )
 
--- | Replies "pong" to every message that starts with "ping"
+data BotAction
+  = PlayVoice String
+  | LeaveVoice
+
+data GuildContext = GuildContext
+  { songQueries :: [String],
+    leaveFunc :: Voice () -- function to leave voice channel
+  }
+
+parser :: ParserInfo BotAction
+parser = flip info fullDesc $ helper <*> commandParser
+  where
+    commandParser =
+      subparser $
+        mconcat
+          [ leaveParser,
+            playParser
+          ]
+
+    leaveParser =
+      command "leave" $
+        info (pure LeaveVoice) (progDesc "Leave a voice channel")
+    playParser =
+      command "play" $
+        flip info (progDesc "Queue something to play!") $
+          PlayVoice . unwords
+            <$> some (argument str (metavar "QUERY" <> help "Search query/URL"))
+
 main :: IO ()
 main = do
-    userFacingError <- runDiscord $ def
-             { discordToken = "Bot ZZZZZZZZZZZZZZZZZZZ"
-             , discordOnEvent = eventHandler
-             , discordOnLog = \s -> TIO.putStrLn s >> TIO.putStrLn ""
-             } -- if you see OnLog error, post in the discord / open an issue
+  tok <- TIO.readFile "./auth-token.secret"
 
-    TIO.putStrLn userFacingError
-    -- userFacingError is an unrecoverable error
-    -- put normal 'cleanup' code in discordOnEnd (see examples)
+  queries <- M.newIO
+  void $
+    runDiscord $
+      def
+        { discordToken = tok,
+          discordOnStart = pure (),
+          discordOnEnd = liftIO $ putStrLn "Ended",
+          discordOnEvent = eventHandler queries,
+          discordOnLog = TIO.putStrLn
+        }
+  putStrLn "Exiting..."
 
-eventHandler :: Event -> DiscordHandler ()
-eventHandler event = case event of
-    MessageCreate m -> when (isPing m && not (fromBot m)) $ do
-        void $ restCall (R.CreateReaction (messageChannelId m, messageId m) "eyes")
-        threadDelay (2 * 10^6)
-        void $ restCall (R.CreateMessage (messageChannelId m) "Pong!")
-    _ -> return ()
+eventHandler :: M.Map String GuildContext -> Event -> DiscordHandler ()
+eventHandler contexts (MessageCreate msg) = case messageGuildId msg of
+  Nothing -> pure ()
+  Just gid -> do
+    let args = map T.unpack $ T.words $ messageContent msg
+    case args of
+      ("bot" : _) -> case execParserPure defaultPrefs parser $ tail args of
+        Success x -> handleCommand contexts msg gid x
+        Failure failure ->
+          void $
+            restCall $
+              R.CreateMessage (messageChannelId msg) $
+                T.pack $
+                  fst $
+                    renderFailure failure "bot"
+        _ -> pure ()
+      _ -> pure ()
+eventHandler _ _ = pure ()
 
-fromBot :: Message -> Bool
-fromBot = userIsBot . messageAuthor
+playYouTube :: String -> Voice ()
+playYouTube query = do
+  let adjustVolume = awaitForever $ \current -> yield current
+  resource <- createYoutubeResource query $ Just $ HaskellTransformation $ packInt16C .| adjustVolume .| unpackInt16C
 
-isPing :: Message -> Bool
-isPing = ("ping" `isPrefixOf`) . toLower . messageContent
+  case resource of
+    Nothing -> liftIO $ print "whoops"
+    Just re -> play re UnknownCodec
+
+joinVoiceChannel :: M.Map String GuildContext -> GuildId -> String -> DiscordHandler ()
+joinVoiceChannel contexts gid query = do
+  response <- restCall $ R.GetGuildChannels gid
+  mbCid <- case response of
+    Left err -> liftIO (print err) >> return Nothing
+    Right channels -> return $ (Just . channelId . last) [c | c@ChannelVoice {} <- channels]
+  result <- runVoice $ case mbCid of
+    Nothing -> return ()
+    Just cid -> do
+      leave <- join gid cid
+      liftDiscord $ atomically $ M.insert (GuildContext [query] leave) (show gid) contexts
+      -- Forever, read the top of the queue and play it
+      forever $ do
+        context <- liftDiscord $ atomically $ M.lookup (show gid) contexts
+        case context of
+          Nothing -> pure ()
+          Just (GuildContext [] _) -> pure ()
+          Just (GuildContext (x : xs) _) -> do
+            liftDiscord $ atomically $ M.insert (GuildContext xs leave) (show gid) contexts
+            playYouTube x
+  case result of
+    Left e -> void $ liftIO (print e)
+    Right _ -> return ()
+
+handleCommand :: M.Map String GuildContext -> Message -> GuildId -> BotAction -> DiscordHandler ()
+handleCommand contexts _msg gid LeaveVoice = do
+  context <- atomically $ M.lookup (show gid) contexts
+  case context of
+    Nothing -> pure ()
+    Just (GuildContext _ leave) -> do
+      void $ atomically $ M.delete (show gid) contexts
+      void $ runVoice leave
+handleCommand contexts msg gid (PlayVoice q) = do
+  resultQueue <- atomically $ do
+    context <- M.lookup (show gid) contexts
+    case context of
+      Nothing -> return []
+      Just (GuildContext xs leave) -> do
+        M.insert (GuildContext (xs ++ [q]) leave) (show gid) contexts
+        return $ xs ++ [q]
+  when (null resultQueue) (joinVoiceChannel contexts gid q)
+  void $
+    restCall $
+      R.CreateMessage (messageChannelId msg) $
+        T.pack $
+          "Queued for playback: " <> show q
